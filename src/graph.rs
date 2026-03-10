@@ -33,6 +33,11 @@ pub struct EdgeWeight {
     pub hop_cost:      u8,     // Logical hop cost (SuperNode=1, IoT=10)
 }
 
+pub fn node_count(&self) -> usize { self.nodes.len() }
+pub fn edge_count(&self) -> usize {
+    self.adjacency.iter().map(|e| e.value().len()).sum::<usize>() / 2
+}
+
 impl EdgeWeight {
     /// Composite scalar cost — used as Dijkstra edge weight
     /// Formula balances latency (dominant), loss, and hop count
