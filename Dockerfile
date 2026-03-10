@@ -61,9 +61,9 @@ USER supernode
 # 9090 - Prometheus metrics
 EXPOSE 9000 3000 9090
 
-# Health check
+# Health check (uses API_PORT env var, defaults to 3000)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f http://localhost:${API_PORT:-3000}/health || exit 1
 
 # Run the application
 CMD ["supernode"]

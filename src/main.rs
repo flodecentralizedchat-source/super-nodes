@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tracing::{info, error, Level};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
+use std::env;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -49,7 +50,9 @@ async fn main() -> Result<()> {
     info!("SuperNode ID: {}", this_id);
 
     // ── NAT Traversal (STUN) ───────────────────────────────
-    let _public_addr = nat::discover_public_address("stun.l.google.com:19302").await.unwrap_or_else(|_| "0.0.0.0:9000".to_string());
+    let default_port = env::var("PORT").unwrap_or_else(|_| "9000".to_string());
+    let default_addr = format!("0.0.0.0:{}", default_port);
+    let _public_addr = nat::discover_public_address("stun.l.google.com:19302").await.unwrap_or_else(|_| default_addr);
 
     // ── Spawn the server ───────────────────────────────────
     let server = SuperNodeServer::new(this_id, graph.clone());
@@ -111,17 +114,22 @@ mod tests {
     info!("Heartbeat manager running");
 
     // ── Spawn API Server ───────────────────────────────────
+    let api_port = env::var("API_PORT").unwrap_or_else(|_| "3000".to_string());
+    let api_addr = format!("0.0.0.0:{}", api_port);
     let api_graph = graph.clone();
     tokio::spawn(async move {
-        if let Err(e) = api::start_api_server(api_graph, 3000).await {
+        let port = api_port.parse::<u16>().unwrap_or(3000);
+        if let Err(e) = api::start_api_server(api_graph, port).await {
             error!("API server failed: {}", e);
         }
     });
-    info!("🌐 API server starting on http://0.0.0.0:3000");
+    info!("🌐 API server starting on http://{}", api_addr);
 
     // ── Listen for connections ─────────────────────────────
-    info!("Starting listener...");
-    server.listen("0.0.0.0:9000").await?;
+    let main_port = env::var("PORT").unwrap_or_else(|_| "9000".to_string());
+    let main_addr = format!("0.0.0.0:{}", main_port);
+    info!("Starting listener on {}...", main_addr);
+    server.listen(&main_addr).await?;
 
     Ok(())
 }
