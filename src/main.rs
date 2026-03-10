@@ -100,6 +100,15 @@ mod tests {
         });
     }
 
+    // ── Heartbeat Background Task ──────────────────────────
+    let heartbeat_manager = crate::network::HeartbeatManager {
+        connections: server.connections.clone(),
+        graph: server.graph.clone(),
+        router: server.router.clone(),
+    };
+    tokio::spawn(async move { heartbeat_manager.run().await; });
+    info!("Heartbeat manager running");
+
     // ── Listen for connections ─────────────────────────────
     info!("Starting listener...");
     server.listen("0.0.0.0:9000").await?;
