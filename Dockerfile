@@ -4,7 +4,7 @@
 # ============================================================
 # Stage 1: Build
 # ============================================================
-FROM rust:1.85-slim-bookworm as builder
+FROM rust:1.88-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -33,6 +33,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos '' supernode
 
