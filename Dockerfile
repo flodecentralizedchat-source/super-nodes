@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y \
     && adduser --disabled-password --gecos '' supernode
 
 # Copy binary from builder
-COPY --from=builder/app/target/release/supernode /usr/local/bin/supernode
+COPY --from=builder /app/target/release/supernode /usr/local/bin/supernode
 
 # Set permissions
 RUN chmod +x /usr/local/bin/supernode \
