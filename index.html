@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SuperNode Dashboard</title>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+
+<body style="margin: 0; padding: 0; background: #020810; font-family: 'Roboto Mono', sans-serif;">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ── Rust Source Files ──────────────────────────────────────
+    const RUST_FILES = {
+      "Cargo.toml": {
+        lang: "toml", icon: "📦",
+        desc: "Dependencies powering 8B connections",
+        content: `[package]
+name = "supernode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime — M:N threading, millions of tasks on few threads
+tokio = { version = "1.35", features = ["full"] }
+
+# Zero-copy serialization (10x faster than JSON on hot paths)
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# QUIC transport (0-RTT reconnects, no head-of-line blocking)
+quinn = "0.10"
+
+# Lock-free concurrent HashMap (critical at 8B scale)
+dashmap = "5.5"
+
+# Lock-free channels + parallel edge sorting for MST
+crossbeam = "0.8"
+rayon = "1.8"
+
+# Graph algorithms — Dijkstra, BFS, MST
+petgraph = "0.6"
+
+# Ultra-fast hashing (used by Linux kernel)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Consistent hashing ring — distributes 8B nodes across shards
+consistent_hash = "0.1"
+
+# 3-5x payload compression (critical for IoT bandwidth)
+lz4_flex = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "fat"         # Link-time optimization
+codegen-units = 1   # Max optimization
+panic = "abort"     # No stack unwinding overhead`
+      },
+      "src/node.rs": {
+        lang: "rust", icon: "🔷",
+        desc: "Node identity, types, 128-bit NodeId",
+        content: `// NodeId: 128-bit globally unique identifier
+// Format: [region(8b)|shard(16b)|timestamp(48b)|random(56b)]
+// This layout → O(1) region lookup by masking high bits
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u128);
+
+impl NodeId {
+    pub fn new() -> Self { NodeId(Uuid::new_v4().as_u128()) }
+
+    // Extract region from top 8 bits → O(1) region routing
+    pub fn region_hint(&self) -> u8 { (self.0 >> 120) as u8 }
+
+    // Shard index for partitioning 8B nodes across 65536 shards
+    pub fn shard_hint(&self) -> u16 { ((self.0 >> 104) & 0xFFFF) as u16 }
+}
+
+pub enum NodeType {
+    SuperNode,                        // 10M connections, 100Gbps
+    RegionalHub,                      // 500K connections, 10Gbps
+    Server,                           // 50K connections, 1Gbps
+    Laptop  { battery_pct: u8 },      // 256 connections
+    Mobile  { os: MobileOS, signal_dbm: i8 },  // 64 connections
+    IoT     { category: IoTCategory }, // 8 connections
+    Vehicle { speed_kmh: u16 },       // 128 connections (mobile)
+    Satellite { orbital_slot: u32 },  // 1M connections
+}
+
+impl NodeType {
+    pub fn max_connections(&self) -> u32 {
+        match self {
+            SuperNode    => 10_000_000,
+            Satellite    => 1_000_000,
+            RegionalHub  => 500_000,
+            Server       => 50_000,
+            // ... total across 800 SuperNodes = 8,000,000,000
+        }
+    }
+}`
+      },
+      "src/graph.rs": {
+        lang: "rust", icon: "🕸️",
+        desc: "Dijkstra, BFS, A*, Kruskal MST, Gossip",
+        content: `// ── DIJKSTRA — Shortest Path Routing ──────────────────────
+// Time: O((V+E) log V) — Bidirectional cuts this to O(sqrt(V) log V)
+// Used: finding optimal route for every packet
+pub fn dijkstra(graph: &MeshGraph, source: &NodeId, target: &NodeId)
+    -> Option<RouteEntry>
+{
+    let mut dist: HashMap<NodeId, f64> = HashMap::new();
+    let mut prev: HashMap<NodeId, NodeId> = HashMap::new();
+    // BinaryHeap is max-heap → Reverse<u64> makes it min-heap
+    let mut heap: BinaryHeap<(Reverse<u64>, NodeId)> = BinaryHeap::new();
+
+    dist.insert(*source, 0.0);
+    heap.push((Reverse(0), *source));
+
+    while let Some((Reverse(cost_int), current)) = heap.pop() {
+        if &current == target {
+            return Some(build_route(&prev, source, target, cost_int));
+        }
+        // Lazy deletion: skip stale heap entries
+        if cost_int as f64 / 1000.0 > dist[&current] + 0.001 { continue; }
+
+        for (neighbor, weight) in &graph.adjacency[&current] {
+            let new_cost = dist[&current] + weight.cost();
+            if new_cost < *dist.get(neighbor).unwrap_or(&f64::INFINITY) {
+                dist.insert(*neighbor, new_cost);
+                prev.insert(*neighbor, current);
+                heap.push((Reverse((new_cost * 1000.0) as u64), *neighbor));
+            }
+        }
+    }
+    None
+}
+
+// ── A* SEARCH — Geography-aware routing ────────────────────
+// Heuristic: Haversine distance → estimated latency
+// Typically 10-50x faster than Dijkstra on geo networks
+fn haversine_ms(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6371.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat/2.0).sin().powi(2)
+          + lat1.to_radians().cos() * lat2.to_radians().cos()
+          * (dlon/2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0-a).sqrt());
+    R * c * 0.005  // km → ms (fiber speed factor)
+}
+
+// ── KRUSKAL MST — Backbone Optimization ────────────────────
+// Parallel edge sort using Rayon (multi-core)
+edges.par_sort_unstable_by(|a, b| a.2.cost().partial_cmp(&b.2.cost()));
+// Union-Find DSU with path compression: O(α(n)) ≈ O(1)
+
+// ── GOSSIP PROTOCOL — State Propagation ────────────────────
+// Reaches ALL 8B nodes in ceil(log6(8B)) ≈ 12 rounds
+// Each round: every node forwards to 6 random peers`
+      },
+      "src/network.rs": {
+        lang: "rust", icon: "📡",
+        desc: "10M connections per SuperNode, zero-copy I/O",
+        content: `// HOW WE ACHIEVE 8 BILLION CONNECTIONS:
+//
+// Architecture:
+//   800 SuperNodes × 10,000,000 conns each = 8,000,000,000
+//
+// 1. Tokio async runtime — M:N green threading
+//    Each connection = 1 Tokio task ≈ 2KB stack
+//    8B connections × 2KB = 16TB RAM (distributed)
+//    Realistic active at once: ~1B → 2TB across all SuperNodes
+//
+// 2. DashMap — lock-free concurrent HashMap
+//    64-shard striped locking → near O(1) concurrent insert/lookup
+//    10M entries per SuperNode → ~2GB memory
+//
+// 3. Connection semaphore — backpressure at capacity
+//    If SuperNode hits 10M: reject + redirect to nearest peer
+//
+// 4. lz4 compression — 3-5x bandwidth reduction for IoT
+
+pub async fn listen(&self, bind_addr: &str) -> Result<()> {
+    let listener = TcpListener::bind(bind_addr).await?;
+
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+
+        // Non-blocking capacity check
+        let permit = match self.conn_semaphore.clone().try_acquire_owned() {
+            Ok(p)  => p,
+            Err(_) => {
+                warn!("At capacity, redirecting {}", peer_addr);
+                redirect_to_peer_supernode(stream).await;
+                continue;
+            }
+        };
+
+        // Spawn task: ~2KB overhead, fully async
+        tokio::spawn(async move {
+            let _permit = permit; // Auto-released when task ends
+            handle_connection(stream, ...).await;
+        });
+        // Returns immediately — next accept() while prev task runs
+    }
+}
+
+// Zero-copy routing: Arc<Vec<u8>> passed by reference
+// Route cache: DashMap<NodeId, NodeId> → 99%+ cache hit rate
+// Cache miss → Dijkstra → insert cache → forward`
+      },
+      "src/packet.rs": {
+        lang: "rust", icon: "📨",
+        desc: "32-byte fixed header, binary wire protocol",
+        content: `// Packet wire format — 32-byte fixed header
+// All fields big-endian for SIMD parsing
+//
+// [0..16]  source NodeId      (128-bit)
+// [16..32] destination NodeId (128-bit)
+// [32..40] sequence number    (u64)
+// [40..48] timestamp µs       (u64)
+// [48]     packet type        (u8)
+// [49]     TTL                (u8, starts at 64, drop at 0)
+// [50]     priority           (u8: Critical/High/Normal/Low/Bulk)
+// [51]     flags              (u8 bitfield)
+// [52..56] payload length     (u32)
+// [56..]   payload            (variable, lz4 compressed if flag set)
+
+pub enum PacketType {
+    // Control plane
+    Heartbeat    = 0x02,  // TTL=1, never multi-hops
+    RouteUpdate  = 0x04,  // Gossip-propagated topology changes
+    NodeJoin     = 0x05,  // Fanout=6, reaches 8B in 12 rounds
+    NodeLeave    = 0x06,
+
+    // Data plane
+    Data         = 0x10,  // Normal unicast message
+    Multicast    = 0x13,  // One → many (uses MST broadcast tree)
+    Broadcast    = 0x14,  // TTL=7, limited flood
+
+    // Compute plane
+    TaskSubmit   = 0x20,  // Distribute work to capable nodes
+    TaskResult   = 0x21,
+}
+
+impl Packet {
+    pub fn decrement_ttl(&mut self) -> bool {
+        if self.header.ttl == 0 { return false; }
+        self.header.ttl -= 1;
+        self.header.ttl > 0  // false = drop packet (routing loop protection)
+    }
+}`
+      }
+    };
+
+    // ── Regions ────────────────────────────────────────────────
+    const REGIONS = [
+      { id: "NA_E", label: "N. America E", x: 180, y: 140, color: "#00ff88", nodes: 1_200_000_000 },
+      { id: "NA_W", label: "N. America W", x: 120, y: 130, color: "#00ff88", nodes: 800_000_000 },
+      { id: "SA", label: "S. America", x: 210, y: 280, color: "#ffcc00", nodes: 450_000_000 },
+      { id: "EU_W", label: "Europe W", x: 380, y: 110, color: "#00cfff", nodes: 750_000_000 },
+      { id: "EU_E", label: "Europe E", x: 450, y: 120, color: "#00cfff", nodes: 300_000_000 },
+      { id: "AF", label: "Africa", x: 420, y: 240, color: "#ff9500", nodes: 500_000_000 },
+      { id: "ME", label: "Middle East", x: 500, y: 170, color: "#ff9500", nodes: 220_000_000 },
+      { id: "SA2", label: "S. Asia", x: 580, y: 185, color: "#bf7fff", nodes: 1_800_000_000 },
+      { id: "EA", label: "E. Asia", x: 680, y: 145, color: "#bf7fff", nodes: 1_600_000_000 },
+      { id: "SEA", label: "SE Asia", x: 660, y: 230, color: "#ff5599", nodes: 700_000_000 },
+      { id: "OCE", label: "Oceania", x: 720, y: 320, color: "#ff5599", nodes: 30_000_000 },
+      { id: "ORB", label: "Orbital", x: 550, y: 50, color: "#ffffff", nodes: 1_000_000 },
+    ];
+
+    const SUPERNODE_ROUTES = [
+      ["NA_E", "EU_W"], ["NA_E", "NA_W"], ["EU_W", "EU_E"], ["EU_W", "AF"],
+      ["EU_E", "ME"], ["ME", "SA2"], ["SA2", "EA"], ["SA2", "SEA"],
+      ["EA", "SEA"], ["EA", "OCE"], ["NA_E", "SA"], ["AF", "ME"],
+      ["ORB", "NA_E"], ["ORB", "EA"], ["ORB", "EU_W"],
+    ];
+
+    function fmt(n) {
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(0) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(0) + "K";
+      return n.toString();
+    }
+
+    function AnimCounter({ target, duration = 2000, prefix = "", suffix = "" }) {
+      const [val, setVal] = useState(0);
+      useEffect(() => {
+        let start = null;
+        const step = (ts) => {
+          if (!start) start = ts;
+          const p = Math.min((ts - start) / duration, 1);
+          setVal(Math.floor(p * p * target));
+          if (p < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }, [target]);
+      return <span>{prefix}{fmt(val)}{suffix}</span>;
+    }
+
+    function SuperNodeDashboard() {
+      const [tab, setTab] = useState("overview"); // overview | code | algo | simulate
+      const [activeFile, setActiveFile] = useState("src/graph.rs");
+      const [activeAlgo, setActiveAlgo] = useState("dijkstra");
+      const [simRunning, setSimRunning] = useState(false);
+      const [activeRoute, setActiveRoute] = useState(null);
+      const [routeStep, setRouteStep] = useState(0);
+      const [gossipWave, setGossipWave] = useState([]);
+      const [mstEdges, setMstEdges] = useState([]);
+      const [bfsNodes, setBfsNodes] = useState([]);
+      const [packets, setPackets] = useState(0);
+      const [connections, setConnections] = useState(0);
+      const [log, setLog] = useState([]);
+      const intervalRef = useRef(null);
+      const svgRef = useRef(null);
+
+      // Animate connection counter
+      useEffect(() => {
+        const target = 8_000_000_000;
+        let v = 0;
+        const t = setInterval(() => {
+          v = Math.min(v + 47_000_000 + Math.random() * 30_000_000, target);
+          setConnections(Math.floor(v));
+          if (v >= target) clearInterval(t);
+        }, 50);
+        return () => clearInterval(t);
+      }, []);
+
+      // Live packet counter
+      useEffect(() => {
+        const t = setInterval(() => {
+          setPackets(p => p + Math.floor(800_000 + Math.random() * 400_000));
+        }, 100);
+        return () => clearInterval(t);
+      }, []);
+
+      const addLog = (msg) => setLog(l => [`${new Date().toLocaleTimeString()} › ${msg}`, ...l].slice(0, 15));
+
+      const resetSim = () => {
+        clearInterval(intervalRef.current);
+        setSimRunning(false);
+        setActiveRoute(null);
+        setRouteStep(0);
+        setGossipWave([]);
+        setMstEdges([]);
+        setBfsNodes([]);
+      };
+
+      const runSim = () => {
+        resetSim();
+        setSimRunning(true);
+
+        if (activeAlgo === "dijkstra" || activeAlgo === "astar") {
+          const route = ["NA_W", "NA_E", "EU_W", "EU_E", "ME", "SA2", "EA"];
+          setActiveRoute(route);
+          addLog(`${activeAlgo === "dijkstra" ? "Dijkstra" : "A*"}: routing NA_W → EA`);
+          let step = 0;
+          intervalRef.current = setInterval(() => {
+            step++;
+            setRouteStep(step);
+            addLog(`Hop ${step}: ${route[step - 1]} → ${route[step] || "DELIVERED ✓"}`);
+            if (step >= route.length) { clearInterval(intervalRef.current); setSimRunning(false); }
+          }, 500);
+        } else if (activeAlgo === "bfs") {
+          addLog("BFS Discovery: scanning from EU_W");
+          const order = ["EU_W", "EU_E", "AF", "NA_E", "ME", "NA_W", "SA", "SA2", "ORB", "EA", "SEA", "OCE"];
+          let step = 0;
+          intervalRef.current = setInterval(() => {
+            step++;
+            setBfsNodes(order.slice(0, step));
+            addLog(`BFS layer ${step}: discovered ${order[step - 1]}`);
+            if (step >= order.length) { clearInterval(intervalRef.current); setSimRunning(false); }
+          }, 300);
+        } else if (activeAlgo === "kruskal") {
+          addLog("Kruskal MST: building minimum backbone");
+          const edges = SUPERNODE_ROUTES.slice(0, 12);
+          let step = 0;
+          intervalRef.current = setInterval(() => {
+            step++;
+            setMstEdges(edges.slice(0, step));
+            addLog(`MST edge ${step}: ${edges[step - 1]?.[0]} — ${edges[step - 1]?.[1]}`);
+            if (step >= edges.length) { clearInterval(intervalRef.current); setSimRunning(false); }
+          }, 200);
+        } else if (activeAlgo === "gossip") {
+          addLog("Gossip broadcast from EA (fanout=6)");
+          const waves = [
+            ["EA"],
+            ["EA", "SEA", "SA2", "NA_E", "EU_W", "ORB"],
+            ["EA", "SEA", "SA2", "NA_E", "EU_W", "ORB", "OCE", "ME", "EU_E", "NA_W", "AF", "SA"],
+          ];
+          let w = 0;
+          intervalRef.current = setInterval(() => {
+            setGossipWave(waves[w] || waves[waves.length - 1]);
+            addLog(`Round ${w + 1}: ${waves[w]?.length || 12} nodes reached`);
+            w++;
+            if (w >= waves.length) {
+              addLog("ALL 8B NODES REACHED in 12 rounds ✓");
+              clearInterval(intervalRef.current);
+              setSimRunning(false);
+            }
+          }, 700);
+        } else if (activeAlgo === "bgp") {
+          addLog("BGP: Calculating path factoring in AS Policies");
+          addLog("Policy: DENY transit through SA2 (Political Block)");
+          // Dijkstra would normally go EA -> SA2 -> ME. BGP policy forces the long way:
+          const route = ["EA", "SEA", "OCE", "AF", "ME"];
+          setActiveRoute(route);
+          let step = 0;
+          intervalRef.current = setInterval(() => {
+            step++;
+            setRouteStep(step);
+            addLog(`BGP Hop ${step}: AS path +${route[step - 1]}`);
+            if (step >= route.length) { clearInterval(intervalRef.current); setSimRunning(false); }
+          }, 600);
+        } else if (activeAlgo === "ecmp") {
+          addLog("ECMP (Equal Cost Multi-Path): Splitting traffic");
+          addLog("Target: EU_E from NA_W. Discovered two parallel equal-cost paths.");
+
+          // Visualizing two paths simultaneously
+          setMstEdges([
+            ["NA_W", "NA_E"], ["NA_E", "EU_W"], ["EU_W", "EU_E"], // Northern path
+            ["NA_W", "NA_E"], ["NA_E", "SA"], ["SA", "AF"], ["AF", "EU_E"] // Southern path
+          ]);
+
+          let cycle = 0;
+          intervalRef.current = setInterval(() => {
+            cycle++;
+            if (cycle % 2 === 0) {
+              setActiveRoute(["NA_W", "NA_E", "EU_W", "EU_E"]);
+              addLog(`Flow A: using northern path [Link Load 50%]`);
+            } else {
+              setActiveRoute(["NA_W", "NA_E", "SA", "AF", "EU_E"]);
+              addLog(`Flow B: using southern path [Link Load 50%]`);
+            }
+            setRouteStep(cycle % 5);
+            if (cycle >= 10) { clearInterval(intervalRef.current); setSimRunning(false); }
+          }, 400);
+        } else if (activeAlgo === "handoff") {
+          addLog("Mobile Handoff: EV traveling at 120km/h across borders");
+          addLog("Current Tower: EU_W (-85 dBm, dropping -2 dBm/s)");
+          const signalDecay = [-85, -87, -89, -91, -93, -95, -97];
+          let t = 0;
+          intervalRef.current = setInterval(() => {
+            if (t === 0) setActiveRoute(["EU_W"]);
+            else if (t < 5) {
+              setRouteStep(0);
+              addLog(`EU_W Signal: ${signalDecay[t]} dBm. EU_E projecting stronger.`);
+            } else if (t === 5) {
+              addLog("SOFT HANDOFF EXECUTED. Make-before-break.");
+              setActiveRoute(["EU_W", "EU_E"]);
+              setRouteStep(1);
+            } else if (t === 6) {
+              addLog("Connection transitioned to EU_E cleanly. 0 packet loss.");
+              setActiveRoute(["EU_E"]);
+              setRouteStep(0);
+              clearInterval(intervalRef.current); setSimRunning(false);
+            }
+            t++;
+          }, 600);
+        } else if (activeAlgo === "aco") {
+          addLog("Ant Colony Optimization: Adapting to localized congestion");
+          addLog("Simulating traffic spike at NA_E junction");
+
+          let iteration = 0;
+          intervalRef.current = setInterval(() => {
+            iteration++;
+            if (iteration <= 3) {
+              setActiveRoute(["NA_W", "NA_E", "EU_W"]);
+              setRouteStep(iteration);
+              addLog(`Ant ${iteration}: Took standard route (NA_E). Pheromones evaporating due to congestion (high latency)`);
+            } else if (iteration === 4) {
+              setActiveRoute(["NA_W", "SA", "AF", "EU_W"]);
+              setRouteStep(1);
+              addLog(`Ant 4: Explored SA route. Lower latency! Depositing extra pheromones.`);
+            } else if (iteration <= 8) {
+              setActiveRoute(["NA_W", "SA", "AF", "EU_W"]);
+              setRouteStep(iteration - 3);
+              addLog(`Ant ${iteration}: Followed strong pheromone trail via SA. Traffic routed around jam.`);
+            } else {
+              clearInterval(intervalRef.current); setSimRunning(false);
+            }
+          }, 500);
+        }
+      };
+
+      const getRegionColor = (regionId) => {
+        if (gossipWave.includes(regionId)) return "#ff9500";
+        if (bfsNodes.includes(regionId)) return "#00cfff";
+        if (activeRoute?.includes(regionId)) {
+          const idx = activeRoute.indexOf(regionId);
+          return idx <= routeStep ? "#00ff88" : "#1a4060";
+        }
+        return REGIONS.find(r => r.id === regionId)?.color || "#1a4060";
+      };
+
+      const isPathEdge = (a, b) => {
+        if (!activeRoute || routeStep === 0) return false;
+        for (let i = 0; i < routeStep; i++) {
+          if ((activeRoute[i] === a && activeRoute[i + 1] === b) ||
+            (activeRoute[i] === b && activeRoute[i + 1] === a)) return true;
+        }
+        return false;
+      };
+
+      const isMSTEdge = (a, b) => mstEdges.some(e => (e[0] === a && e[1] === b) || (e[0] === b && e[1] === a));
+
+      const ALGOS = [
+        {
+          id: "dijkstra", label: "Dijkstra", color: "#00ff88", icon: "⚡",
+          desc: "Shortest weighted path routing. O((V+E)log V). Bidirectional variant cuts this in half. Every packet uses this to find optimal hop sequence."
+        },
+        {
+          id: "astar", label: "A* Search", color: "#00cfff", icon: "🎯",
+          desc: "Dijkstra + Haversine heuristic. Geo-aware routing. 10-50× faster in practice. Nodes closer to destination are explored first."
+        },
+        {
+          id: "bfs", label: "BFS Discovery", color: "#ff9500", icon: "🔍",
+          desc: "Layer-by-layer flood from source. O(V+E). Used for topology discovery when a new node joins and needs to build its neighbor table."
+        },
+        {
+          id: "kruskal", label: "Kruskal MST", color: "#bf7fff", icon: "🌲",
+          desc: "Minimum Spanning Tree via sorted edges + Union-Find DSU. Parallel edge sort with Rayon. Builds the cheapest backbone connecting all nodes."
+        },
+        {
+          id: "gossip", label: "Gossip Protocol", color: "#ff5599", icon: "📢",
+          desc: "Epidemic broadcast with fanout=6. Reaches ALL 8 billion nodes in ceil(log₆(8B)) ≈ 12 rounds. Used for route updates, node join/leave events."
+        },
+        {
+          id: "bgp", label: "BGP Policy Routing", color: "#ff3366", icon: "🛡️",
+          desc: "Border Gateway Protocol. Routes packets based on Autonomous System (AS) policies and local preferences, not just shortest path. Core of internet transit."
+        },
+        {
+          id: "ecmp", label: "ECMP Parallel", color: "#00ccff", icon: "🔀",
+          desc: "Equal-Cost Multi-Path. Identifies multiple parallel paths with exactly identical costs and splits traffic across them simultaneously to multiply bandwidth."
+        },
+        {
+          id: "handoff", label: "Mobility Handoff", color: "#ffd700", icon: "🚗",
+          desc: "Predictive tower handoff for mobile/vehicle nodes. Analyzes signal decay (dBm trend) to seamlessly transfer connections BEFORE the original tower drops."
+        },
+        {
+          id: "aco", label: "Ant Colony (ACO)", color: "#aadd00", icon: "🐜",
+          desc: "Bio-inspired machine learning routing. Packets leave a digital 'pheromone' on fast paths, probabilistically pulling traffic to the fastest real-time routes."
+        },
+      ];
+
+      return (
+        <div style={{
+          background: "#020810",
+          minHeight: "100vh",
+          color: "#8ab4cc",
+          fontFamily: "'Roboto Mono', 'Courier New', monospace",
+          fontSize: "13px",
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+        }}>
+          <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@300;400;700&family=Rajdhani:wght@600;700&display=swap');
+        ::-webkit-scrollbar { width: 4px; background: #020810; }
+        ::-webkit-scrollbar-thumb { background: #0d3050; }
+        .tab-btn { background: none; border: none; color: #2a6080; font-family: 'Rajdhani', sans-serif; font-size: 14px; font-weight: 700; letter-spacing: 1px; padding: 10px 20px; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; }
+        .tab-btn:hover { color: #5599bb; }
+        .tab-btn.active { color: #00ff88; border-bottom-color: #00ff88; }
+        .file-btn { background: none; border: none; color: #2a6080; font-family: 'Roboto Mono', monospace; font-size: 11px; padding: 7px 12px; cursor: pointer; width: 100%; text-align: left; border-left: 2px solid transparent; transition: all 0.15s; }
+        .file-btn:hover { color: #5599bb; background: rgba(0,207,255,0.03); }
+        .file-btn.active { color: #00cfff; border-left-color: #00cfff; background: rgba(0,207,255,0.06); }
+        .algo-card { background: #040f1c; border: 1px solid #0a2030; border-radius: 6px; padding: 14px; cursor: pointer; transition: all 0.2s; }
+        .algo-card:hover { border-color: #1a4060; }
+        .algo-card.active { border-color: var(--c); background: rgba(0,0,0,0.3); }
+        .run-btn { background: linear-gradient(135deg, #003322 0%, #005533 100%); border: 1px solid #00ff88; color: #00ff88; padding: 10px 30px; cursor: pointer; font-family: 'Rajdhani', sans-serif; font-size: 15px; font-weight: 700; letter-spacing: 3px; border-radius: 4px; transition: all 0.2s; }
+        .run-btn:hover:not(:disabled) { box-shadow: 0 0 20px rgba(0,255,136,0.25); transform: translateY(-1px); }
+        .run-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+        .reset-btn { background: none; border: 1px solid #1a3040; color: #3a6070; padding: 10px 16px; cursor: pointer; font-family: 'Rajdhani', sans-serif; font-size: 13px; letter-spacing: 1px; border-radius: 4px; transition: all 0.2s; }
+        .reset-btn:hover { border-color: #ff3366; color: #ff3366; }
+        .code-block { background: #030d18; border: 1px solid #0a2030; border-radius: 6px; padding: 20px; overflow-y: auto; max-height: 420px; white-space: pre-wrap; line-height: 1.7; font-size: 12px; color: #5a9ab5; }
+        code .kw  { color: #ff7b5c; }
+        code .fn  { color: #66d9ef; }
+        code .cm  { color: #3a6070; font-style: italic; }
+        code .st  { color: #a8ff78; }
+        code .nu  { color: #ae81ff; }
+        @keyframes pulse-ring { 0%,100%{opacity:0.15;r:18;} 50%{opacity:0.35;r:24;} }
+        @keyframes data-flow { 0%{stroke-dashoffset:20;} 100%{stroke-dashoffset:0;} }
+        @keyframes fade-in { from{opacity:0;transform:translateY(4px);} to{opacity:1;transform:none;} }
+      `}</style>
+
+          {/* ── Header ── */}
+          <div style={{ padding: "12px 24px", borderBottom: "1px solid #061520", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#020c18" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+              <div style={{ fontFamily: "'Rajdhani', sans-serif", fontSize: "22px", fontWeight: 700, color: "#00ff88", letterSpacing: "4px" }}>
+                ⚡ SUPERNODE
+              </div>
+              <div style={{ width: "1px", height: "24px", background: "#0a2030" }} />
+              <div style={{ fontSize: "10px", color: "#1a5060", letterSpacing: "2px" }}>
+                RUST · TOKIO · QUIC · DASHMAP · PETGRAPH
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: "24px", alignItems: "center" }}>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: "18px", color: "#00ff88", fontFamily: "'Rajdhani', sans-serif", fontWeight: 700 }}>
+                  {fmt(connections)}
+                </div>
+                <div style={{ fontSize: "9px", color: "#1a5060", letterSpacing: "1px" }}>CONNECTIONS</div>
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: "18px", color: "#00cfff", fontFamily: "'Rajdhani', sans-serif", fontWeight: 700 }}>
+                  {fmt(packets)}/s
+                </div>
+                <div style={{ fontSize: "9px", color: "#1a5060", letterSpacing: "1px" }}>PACKETS ROUTED</div>
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: "18px", color: "#ff9500", fontFamily: "'Rajdhani', sans-serif", fontWeight: 700 }}>800</div>
+                <div style={{ fontSize: "9px", color: "#1a5060", letterSpacing: "1px" }}>SUPERNODES</div>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Tabs ── */}
+          <div style={{ borderBottom: "1px solid #061520", background: "#020c18", display: "flex" }}>
+            {[["overview", "🌐 Overview"], ["code", "🦀 Rust Code"], ["algo", "📐 Algorithms"], ["simulate", "▶ Simulate"]].map(([id, label]) => (
+              <button key={id} className={`tab-btn ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>{label}</button>
+            ))}
+          </div>
+
+          {/* ── Content ── */}
+          <div style={{ flex: 1, overflow: "auto", padding: "20px 24px" }}>
+
+            {/* ── OVERVIEW TAB ── */}
+            {tab === "overview" && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: "20px" }}>
+                {/* World map SVG */}
+                <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "8px", padding: "16px" }}>
+                  <div style={{ fontSize: "10px", color: "#1a5060", letterSpacing: "2px", marginBottom: "12px" }}>
+                    GLOBAL MESH TOPOLOGY — 12 REGIONS — 800 SUPERNODES
+                  </div>
+                  <svg viewBox="0 0 820 380" style={{ width: "100%" }}>
+                    <defs>
+                      <pattern id="g" width="30" height="30" patternUnits="userSpaceOnUse">
+                        <path d="M 30 0 L 0 0 0 30" fill="none" stroke="#040f1c" strokeWidth="0.5" />
+                      </pattern>
+                    </defs>
+                    <rect width="820" height="380" fill="url(#g)" />
+
+                    {/* Routes */}
+                    {SUPERNODE_ROUTES.map(([a, b], i) => {
+                      const ra = REGIONS.find(r => r.id === a);
+                      const rb = REGIONS.find(r => r.id === b);
+                      if (!ra || !rb) return null;
+                      return (
+                        <line key={i} x1={ra.x} y1={ra.y} x2={rb.x} y2={rb.y}
+                          stroke="#0d2535" strokeWidth="1" strokeOpacity="0.8" />
+                      );
+                    })}
+
+                    {/* Regions */}
+                    {REGIONS.map(r => (
+                      <g key={r.id}>
+                        <circle cx={r.x} cy={r.y} r={20} fill="none" stroke={r.color}
+                          strokeWidth="1" strokeOpacity="0.15" style={{ animation: "pulse-ring 3s infinite" }} />
+                        <circle cx={r.x} cy={r.y} r={14}
+                          fill="#040f1c" stroke={r.color} strokeWidth="1.5" strokeOpacity="0.7" />
+                        <text x={r.x} y={r.y + 4} textAnchor="middle" fontSize="9" fill={r.color} opacity="0.9">⚡</text>
+                        <text x={r.x} y={r.y + 26} textAnchor="middle" fontSize="8" fill={r.color} opacity="0.5">{r.label}</text>
+                        <text x={r.x} y={r.y + 37} textAnchor="middle" fontSize="7" fill={r.color} opacity="0.35">{fmt(r.nodes)}</text>
+                      </g>
+                    ))}
+                  </svg>
+                </div>
+
+                {/* Stats panel */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                  {[
+                    { label: "Total Devices", value: "8,000,000,000", color: "#00ff88", sub: "8 billion worldwide" },
+                    { label: "SuperNodes", value: "800", color: "#00cfff", sub: "10M connections each" },
+                    { label: "Regional Hubs", value: "6,400", color: "#ff9500", sub: "500K connections each" },
+                    { label: "Shards", value: "65,536", color: "#bf7fff", sub: "122K nodes per shard" },
+                    { label: "Gossip Rounds", value: "12", color: "#ff5599", sub: "to reach all 8B nodes" },
+                    { label: "Route Cache Hit", value: ">99%", color: "#ffcc00", sub: "Dijkstra only on miss" },
+                    { label: "MST Backbone", value: "799 edges", color: "#00ff88", sub: "connects all 800 SNs" },
+                    { label: "Packet TTL", value: "64 hops", color: "#00cfff", sub: "loop prevention" },
+                  ].map(s => (
+                    <div key={s.label} style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "12px 14px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                        <span style={{ fontSize: "10px", color: "#2a5060", letterSpacing: "1px" }}>{s.label}</span>
+                        <span style={{ fontFamily: "'Rajdhani', sans-serif", fontSize: "17px", fontWeight: 700, color: s.color }}>{s.value}</span>
+                      </div>
+                      <div style={{ fontSize: "9px", color: "#1a3040", marginTop: "2px" }}>{s.sub}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── CODE TAB ── */}
+            {tab === "code" && (
+              <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: "16px" }}>
+                {/* File tree */}
+                <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "8px 0" }}>
+                  <div style={{ fontSize: "9px", color: "#1a4050", letterSpacing: "2px", padding: "6px 12px 10px" }}>FILES</div>
+                  {Object.entries(RUST_FILES).map(([path, f]) => (
+                    <button key={path} className={`file-btn ${activeFile === path ? "active" : ""}`}
+                      onClick={() => setActiveFile(path)}>
+                      {f.icon} {path}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Code viewer */}
+                <div>
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px 6px 0 0", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ color: "#00cfff", fontSize: "12px" }}>{activeFile}</span>
+                    <span style={{ fontSize: "10px", color: "#1a4050" }}>{RUST_FILES[activeFile]?.desc}</span>
+                  </div>
+                  <div className="code-block" style={{ borderRadius: "0 0 6px 6px", borderTop: "none" }}>
+                    {RUST_FILES[activeFile]?.content}
+                  </div>
+
+                  {/* Architecture note */}
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "16px", marginTop: "12px" }}>
+                    <div style={{ fontSize: "9px", color: "#1a4050", letterSpacing: "2px", marginBottom: "10px" }}>HOW 8B CONNECTIONS WORK IN RUST</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", fontSize: "11px", lineHeight: "1.7", color: "#3a7080" }}>
+                      <div><span style={{ color: "#00ff88" }}>tokio::spawn</span> — Each connection is a lightweight green thread (~2KB). Tokio runs millions on a handful of OS threads.</div>
+                      <div><span style={{ color: "#00cfff" }}>DashMap</span> — Lock-free concurrent HashMap with 64-shard striped locking. 10M entries = ~2GB. O(1) insert/lookup.</div>
+                      <div><span style={{ color: "#ff9500" }}>Semaphore</span> — Backpressure: when a SuperNode hits 10M connections, new arrivals are redirected to the nearest peer SN.</div>
+                      <div><span style={{ color: "#bf7fff" }}>lz4_flex</span> — 3-5× payload compression. Critical for IoT nodes with limited bandwidth. Compression on packets &gt;128 bytes.</div>
+                      <div><span style={{ color: "#ff5599" }}>bincode</span> — Binary serialization. 10× faster than JSON. The 32-byte fixed header is SIMD-parseable.</div>
+                      <div><span style={{ color: "#ffcc00" }}>route_cache</span> — DashMap&lt;NodeId, NodeId&gt; caches next-hop per destination. &gt;99% hit rate = no Dijkstra on hot paths.</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── ALGORITHMS TAB ── */}
+            {tab === "algo" && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                {ALGOS.map(a => (
+                  <div key={a.id} className={`algo-card ${activeAlgo === a.id ? "active" : ""}`}
+                    style={{ "--c": a.color }}
+                    onClick={() => setActiveAlgo(a.id)}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+                      <span style={{ fontSize: "20px" }}>{a.icon}</span>
+                      <span style={{ fontFamily: "'Rajdhani', sans-serif", fontSize: "16px", fontWeight: 700, color: a.color, letterSpacing: "1px" }}>{a.label}</span>
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#3a7080", lineHeight: "1.7" }}>{a.desc}</div>
+                  </div>
+                ))}
+
+                {/* Big detail card */}
+                <div style={{ gridColumn: "1/-1", background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "20px" }}>
+                  <div style={{ fontSize: "10px", color: "#1a4050", letterSpacing: "2px", marginBottom: "14px" }}>SCALING TO 8 BILLION NODES</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px", fontSize: "11px" }}>
+                    {[
+                      { algo: "Dijkstra", how: "Runs per-shard only. Bidirectional variant. Route cache means Dijkstra runs <1% of packets.", color: "#00ff88" },
+                      { algo: "A*", how: "Haversine heuristic cuts explored nodes by ~90% vs Dijkstra. Essential for continental-scale routing.", color: "#00cfff" },
+                      { algo: "BFS", how: "Per-shard discovery only. Full-network topology stored in shard_index condensed graph. Never runs on all 8B nodes.", color: "#ff9500" },
+                      { algo: "Kruskal MST", how: "Rayon parallel sort. Runs on condensed 800-SuperNode graph, not all 8B. Recomputed when topology changes.", color: "#bf7fff" },
+                    ].map(c => (
+                      <div key={c.algo} style={{ background: "#040f1c", border: "1px solid #0d2030", borderRadius: "4px", padding: "12px" }}>
+                        <div style={{ color: c.color, fontFamily: "'Rajdhani', sans-serif", fontSize: "14px", fontWeight: 700, marginBottom: "6px" }}>{c.algo}</div>
+                        <div style={{ color: "#3a6070", lineHeight: "1.6" }}>{c.how}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── SIMULATE TAB ── */}
+            {tab === "simulate" && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: "16px" }}>
+                {/* Map */}
+                <div>
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "8px", padding: "16px" }}>
+                    <div style={{ fontSize: "10px", color: "#1a5060", letterSpacing: "2px", marginBottom: "12px" }}>
+                      LIVE SIMULATION — {ALGOS.find(a => a.id === activeAlgo)?.label}
+                    </div>
+                    <svg viewBox="0 0 820 380" style={{ width: "100%" }}>
+                      <defs>
+                        <pattern id="g2" width="30" height="30" patternUnits="userSpaceOnUse">
+                          <path d="M 30 0 L 0 0 0 30" fill="none" stroke="#040f1c" strokeWidth="0.5" />
+                        </pattern>
+                      </defs>
+                      <rect width="820" height="380" fill="url(#g2)" />
+
+                      {/* Route edges */}
+                      {SUPERNODE_ROUTES.map(([a, b], i) => {
+                        const ra = REGIONS.find(r => r.id === a);
+                        const rb = REGIONS.find(r => r.id === b);
+                        if (!ra || !rb) return null;
+                        const isPath = isPathEdge(a, b);
+                        const isMst = isMSTEdge(a, b);
+                        return (
+                          <line key={i} x1={ra.x} y1={ra.y} x2={rb.x} y2={rb.y}
+                            stroke={isPath ? "#00ff88" : isMst ? "#bf7fff" : "#0a1e30"}
+                            strokeWidth={isPath || isMst ? 2.5 : 1}
+                            strokeDasharray={isPath ? "6 3" : "none"}
+                            style={isPath ? { animation: "data-flow 0.5s linear infinite" } : {}}
+                          />
+                        );
+                      })}
+
+                      {/* Regions */}
+                      {REGIONS.map(r => {
+                        const col = getRegionColor(r.id);
+                        const isActive = gossipWave.includes(r.id) || bfsNodes.includes(r.id) ||
+                          (activeRoute?.includes(r.id) && activeRoute.indexOf(r.id) <= routeStep);
+                        return (
+                          <g key={r.id}>
+                            {isActive && <circle cx={r.x} cy={r.y} r={26} fill={col} opacity="0.1" />}
+                            <circle cx={r.x} cy={r.y} r={16}
+                              fill="#040f1c"
+                              stroke={col}
+                              strokeWidth={isActive ? 2.5 : 1.5}
+                              style={isActive ? { filter: `drop-shadow(0 0 8px ${col})` } : {}}
+                            />
+                            <text x={r.x} y={r.y + 4} textAnchor="middle" fontSize="10" fill={col}>⚡</text>
+                            <text x={r.x} y={r.y + 28} textAnchor="middle" fontSize="8" fill={col} opacity="0.6">{r.label}</text>
+                            <text x={r.x} y={r.y + 39} textAnchor="middle" fontSize="7" fill={col} opacity="0.35">{fmt(r.nodes)}</text>
+                          </g>
+                        );
+                      })}
+
+                      {/* Packet dot on path */}
+                      {activeRoute && routeStep > 0 && routeStep < activeRoute.length && (() => {
+                        const n = REGIONS.find(r => r.id === activeRoute[routeStep]);
+                        if (!n) return null;
+                        return (
+                          <g>
+                            <circle cx={n.x} cy={n.y} r={10} fill="#ffff00" opacity="0.2" />
+                            <circle cx={n.x} cy={n.y} r={5} fill="#ffff00"
+                              style={{ filter: "drop-shadow(0 0 6px #ffff00)" }} />
+                          </g>
+                        );
+                      })()}
+                    </svg>
+                  </div>
+                </div>
+
+                {/* Control panel */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                  {/* Algorithm selector */}
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "12px" }}>
+                    <div style={{ fontSize: "9px", color: "#1a4050", letterSpacing: "2px", marginBottom: "10px" }}>SELECT ALGORITHM</div>
+                    {ALGOS.map(a => (
+                      <button key={a.id} onClick={() => { setActiveAlgo(a.id); resetSim(); }}
+                        style={{
+                          display: "block", width: "100%", background: "none", textAlign: "left",
+                          border: `1px solid ${activeAlgo === a.id ? a.color + "44" : "#0a2030"}`,
+                          color: activeAlgo === a.id ? a.color : "#2a6070",
+                          padding: "7px 10px", marginBottom: "5px", cursor: "pointer",
+                          fontFamily: "'Roboto Mono', monospace", fontSize: "11px", borderRadius: "3px",
+                          background: activeAlgo === a.id ? a.color + "08" : "none",
+                          transition: "all 0.15s",
+                        }}>
+                        {a.icon} {a.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Run/reset */}
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button className="run-btn" onClick={runSim} disabled={simRunning} style={{ flex: 1 }}>
+                      {simRunning ? "RUNNING..." : "▶ RUN"}
+                    </button>
+                    <button className="reset-btn" onClick={resetSim}>↺</button>
+                  </div>
+
+                  {/* Event log */}
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "10px", flex: 1, minHeight: "160px", overflowY: "auto" }}>
+                    <div style={{ fontSize: "9px", color: "#1a4050", letterSpacing: "2px", marginBottom: "8px" }}>EVENT LOG</div>
+                    {log.length === 0 && <div style={{ fontSize: "10px", color: "#0d2535" }}>Select algorithm and press RUN</div>}
+                    {log.map((l, i) => (
+                      <div key={i} style={{ fontSize: "10px", color: i === 0 ? "#00ff88" : "#2a6070", borderBottom: "1px solid #061520", padding: "3px 0", animation: "fade-in 0.2s ease" }}>{l}</div>
+                    ))}
+                  </div>
+
+                  {/* Live counters */}
+                  <div style={{ background: "#030d18", border: "1px solid #0a2030", borderRadius: "6px", padding: "12px" }}>
+                    <div style={{ fontSize: "9px", color: "#1a4050", letterSpacing: "2px", marginBottom: "8px" }}>LIVE NETWORK</div>
+                    {[
+                      ["Connections", fmt(connections), "#00ff88"],
+                      ["Packets/s", fmt(Math.floor(packets / Math.max(1, Date.now() / 1000 - performance.timeOrigin / 1000) * 1000)), "#00cfff"],
+                      ["Active SNs", "800 / 800", "#ff9500"],
+                      ["Avg Latency", "23ms", "#bf7fff"],
+                    ].map(([l, v, c]) => (
+                      <div key={l} style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px", fontSize: "11px" }}>
+                        <span style={{ color: "#2a5060" }}>{l}</span>
+                        <span style={{ color: c, fontFamily: "'Rajdhani', sans-serif", fontWeight: 700 }}>{v}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<SuperNodeDashboard />);
+  </script>
+</body>
+
+</html>
