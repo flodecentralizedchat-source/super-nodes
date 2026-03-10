@@ -47,9 +47,30 @@ impl NodeId {
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = self.as_bytes();
-        write!(f, "{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5])
+       let b = self.as_bytes();
+       write!(f, "{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}",
+           b[0], b[1], b[2], b[3], b[4], b[5])
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = &'static str;
+    
+    /// Parse NodeId from string format "xx:xx:xx:xx:xx:xx" (hex bytes)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+       let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            return Err("Invalid NodeId format: expected 6 colon-separated hex bytes");
+        }
+        
+       let mut bytes = [0u8; 16];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] = u8::from_str_radix(part, 16)
+                .map_err(|_| "Invalid hexadecimal byte")?;
+        }
+        
+        // Remaining bytes are zero-padded
+        Ok(NodeId(u128::from_be_bytes(bytes)))
     }
 }
 
@@ -87,7 +108,7 @@ pub enum NodeType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MobileOS { Android, iOS, HarmonyOS, Other }
+pub enum MobileOS { Android, IOs, HarmonyOS, Other }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IoTCategory { SmartHome, Industrial, Medical, Agricultural, Environmental }
@@ -223,10 +244,71 @@ impl NodeDescriptor {
     }
 
     pub fn is_alive(&self, timeout_secs: u64) -> bool {
-        let now = SystemTime::now()
+       let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
         now.saturating_sub(self.last_seen) < timeout_secs
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+    #[test]
+    fn test_node_id_generation() {
+       let id1 = NodeId::new();
+       let id2 = NodeId::new();
+        
+        // UUIDs should be unique
+        assert_ne!(id1, id2);
+        
+        // Should convert to/from bytes correctly
+       let bytes = id1.as_bytes();
+       let id1_restored = NodeId::from_bytes(bytes);
+        assert_eq!(id1, id1_restored);
+    }
+
+    #[test]
+    fn test_node_id_display() {
+       let id = NodeId::new();
+       let display = format!("{}", id);
+        
+        // Display format should contain dashes
+        assert!(display.contains('-'));
+    }
+
+    #[test]
+    fn test_node_type_max_connections() {
+        assert_eq!(NodeType::SuperNode.max_connections(), 10_000_000);
+        assert_eq!(NodeType::RegionalHub.max_connections(), 500_000);
+        assert_eq!(NodeType::Server.max_connections(), 50_000);
+        assert_eq!(NodeType::Mobile { os: MobileOS::IOs, signal_dbm: -70 }.max_connections(), 64);
+    }
+
+    #[test]
+    fn test_region_latency_calculations() {
+        assert_eq!(Region::NorthAmericaEast.latency_to(&Region::NorthAmericaEast), 1);
+        assert_eq!(Region::NorthAmericaEast.latency_to(&Region::NorthAmericaWest), 20);
+        assert_eq!(Region::EuropeWest.latency_to(&Region::EastAsia), 120);
+    }
+
+    #[test]
+    fn test_capabilities_default() {
+       let caps = Capabilities::default();
+        assert!(!caps.can_relay);
+        assert_eq!(caps.storage_bytes, 0);
+    }
+
+    #[test]
+    fn test_node_descriptor_creation() {
+       let addr = "192.168.1.100:9000".parse().unwrap();
+       let desc = NodeDescriptor::new(NodeType::Server, Region::EuropeWest, addr);
+        
+        assert_eq!(desc.node_type, NodeType::Server);
+        assert_eq!(desc.version, 1);
+        assert!(desc.is_alive(60));
     }
 }
