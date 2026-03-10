@@ -79,3 +79,29 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+// We can add some basic tests here later
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_init() {
+        assert!(true);
+    }
+}
+
+    // ── Simulated Traffic ───────────────────────────────────
+    {
+        let router = server.router.clone();
+        let connections = server.connections.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(100));
+            loop {
+                ticker.tick().await;
+                // We just simulate routing a dummy packet every 100ms
+                let dummy_packet = crate::packet::Packet::new_heartbeat(NodeId::new());
+                router.route(dummy_packet, &connections).await;
+            }
+        });
+    }
