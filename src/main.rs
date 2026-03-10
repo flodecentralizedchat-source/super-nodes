@@ -11,10 +11,12 @@ mod packet;
 pub mod telemetry;
 pub mod storage;
 pub mod nat;
+mod api;
 
 use crate::node::{NodeDescriptor, NodeId, NodeType, Region};
 use crate::graph::{MeshGraph, EdgeWeight};
 use crate::network::SuperNodeServer;
+use crate::api;
 use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -109,20 +111,18 @@ mod tests {
     tokio::spawn(async move { heartbeat_manager.run().await; });
     info!("Heartbeat manager running");
 
+    // ── Spawn API Server ───────────────────────────────────
+    let api_graph = graph.clone();
+    tokio::spawn(async move {
+        if let Err(e) = api::start_api_server(api_graph, 3000).await {
+            error!("API server failed: {}", e);
+        }
+    });
+    info!("🌐 API server starting on http://0.0.0.0:3000");
+
     // ── Listen for connections ─────────────────────────────
     info!("Starting listener...");
     server.listen("0.0.0.0:9000").await?;
 
     Ok(())
-}
-
-// We can add some basic tests here later
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_server_init() {
-        assert!(true);
-    }
 }

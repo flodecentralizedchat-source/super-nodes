@@ -1,0 +1,12 @@
+# Ignore these during docker build
+target/
+**/*.rs.bk
+Cargo.lock
+.git
+.gitignore
+.qoder/
+*.md
+.env
+*.log
+.DS_Store
+src/main.rs.orig

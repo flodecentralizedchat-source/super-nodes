@@ -1,0 +1,108 @@
+# Fly.io configuration for SuperNode
+# Deploy globally with low-latency edge computing
+
+app = "super-nodes"
+primary_region = "sjc" # San Jose (default, can be changed)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "9000"
+  API_PORT = "3000"
+  METRICS_PORT = "9090"
+ RUST_LOG = "info"
+
+# HTTP services
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 500
+  
+  [[http_service.ports]]
+    port = 80
+    handlers = ["http"]
+    
+  [[http_service.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+      [http_service.ports.tls_options]
+        alpn = ["h2", "http/1.1"]
+
+# QUIC/WebSocket service (main server)
+[[services]]
+  protocol = "udp"
+  internal_port = 9000
+  
+  [[services.ports]]
+    port = 9000
+    
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 10000
+    soft_limit = 5000
+  
+  [[services.tcp_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "30s"
+
+# Metrics endpoint (optional, for monitoring)
+[[vm_services]]
+  internal_port = 9090
+
+# Virtual machine configuration
+[vm]
+  size = "performance-1x" # or "shared-cpu-1x" for cheaper option
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Scaling configuration
+[scaling]
+  min_machines = 1
+  max_machines = 10
+  
+# Regions to deploy to (edge locations)
+[[regions]]
+  region = "sjc" # San Jose
+  priority = 1
+
+[[regions]]
+  region = "lax" # Los Angeles
+  priority = 2
+
+[[regions]]
+  region = "ord" # Chicago
+  priority = 2
+
+[[regions]]
+  region = "iad" # Washington DC
+  priority = 2
+
+[[regions]]
+  region = "ams" # Amsterdam
+  priority = 3
+
+[[regions]]
+  region = "nrt" # Tokyo
+  priority = 3
+
+# Volume for persistent storage (if needed)
+# Uncomment if you need disk persistence
+# [[mounts]]
+#   source = "supernode_data"
+#   destination = "/data"
+#   initial_size = "1gb"
+
+# Deployment strategy
+[deploy]
+  release_command = ""
+  strategy = "rolling"
+  max_unavailable = 1

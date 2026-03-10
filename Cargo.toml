@@ -31,7 +31,7 @@ petgraph = "0.6"             # Graph data structures + Dijkstra, MST, BFS
 
 # Hashing & IDs
 xxhash-rust = { version = "0.8", features = ["xxh3"] }  # Fastest hash (used by Linux kernel)
-uuid = { version = "1.6", features = ["v4", "fast-rng"] }
+uuid = { version = "1.6.1", features = ["v4", "fast-rng"] }  # Pinned to avoid Rust 1.85+ requirement
 consistent_hash = "0.1"      # Consistent hashing ring for sharding
 
 # Compression
@@ -47,6 +47,11 @@ metrics-exporter-prometheus = "0.13"
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# HTTP Server
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
