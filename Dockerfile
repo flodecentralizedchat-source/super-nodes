@@ -23,13 +23,13 @@ COPY Cargo.toml ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Cache dependencies (faster rebuilds)
-RUN cargo fetch --locked || true
+RUN cargo fetch || true
 
 # Copy full source code
 COPY . .
 
 # Build in release mode
-RUN cargo build --release --locked
+RUN cargo build --release
 
 # ============================================================
 # Stage 2: Runtime
