@@ -16,9 +16,8 @@ mod api;
 use crate::node::{NodeDescriptor, NodeId, NodeType, Region};
 use crate::graph::{MeshGraph, EdgeWeight};
 use crate::network::SuperNodeServer;
-use crate::api;
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::{info, error, Level};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
 

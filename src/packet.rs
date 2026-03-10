@@ -14,7 +14,7 @@ use crate::node::NodeId;
 use serde::{Deserialize, Serialize};
 
 // ── Packet Types ───────────────────────────────────────────
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PacketType {
     // ── Control plane ──
@@ -99,7 +99,8 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new_data(source: NodeId, dest: NodeId, data: Vec<u8>) -> Self {
+    #[allow(dead_code)]
+  pub fn new_data(source: NodeId, dest: NodeId, data: Vec<u8>) -> Self {
         Packet {
             header: PacketHeader {
                 source,
@@ -116,7 +117,8 @@ impl Packet {
         }
     }
 
-    pub fn new_heartbeat(source: NodeId, dest: NodeId) -> Self {
+    #[allow(dead_code)]
+  pub fn new_heartbeat(source: NodeId, dest: NodeId) -> Self {
         Packet {
             header: PacketHeader {
                 source,
@@ -133,7 +135,8 @@ impl Packet {
         }
     }
 
-    pub fn new_broadcast(source: NodeId, data: Vec<u8>) -> Self {
+    #[allow(dead_code)]
+  pub fn new_broadcast(source: NodeId, data: Vec<u8>) -> Self {
         // Broadcast destination = all-zeros ID by convention
        let dest = NodeId(0);
         Packet {
@@ -152,7 +155,8 @@ impl Packet {
         }
     }
 
-   pub fn new_ack(source: NodeId, dest: NodeId, acked_seq: u64) -> Self {
+    #[allow(dead_code)]
+  pub fn new_ack(source: NodeId, dest: NodeId, acked_seq: u64) -> Self {
         Packet {
             header: PacketHeader {
                 source,
@@ -169,7 +173,8 @@ impl Packet {
         }
     }
 
-   pub fn new_nack(source: NodeId, dest: NodeId, failed_seq: u64, reason: &str) -> Self {
+    #[allow(dead_code)]
+  pub fn new_nack(source: NodeId, dest: NodeId, failed_seq: u64, reason: &str) -> Self {
        let reason_bytes = reason.as_bytes();
        let mut payload = failed_seq.to_be_bytes().to_vec();
         payload.extend_from_slice(reason_bytes);
@@ -191,27 +196,32 @@ impl Packet {
     }
 
     /// Validate that header payload_len matches actual payload size
-   pub fn validate(&self) -> bool {
+    #[allow(dead_code)]
+  pub fn validate(&self) -> bool {
         self.header.payload_len == self.payload.len() as u32
     }
 
     /// Set compression flag
-   pub fn set_compressed(&mut self, compressed: bool) {
+    #[allow(dead_code)]
+  pub fn set_compressed(&mut self, compressed: bool) {
         self.header.flags.compressed = compressed;
     }
 
     /// Set encryption flag
-   pub fn set_encrypted(&mut self, encrypted: bool) {
+    #[allow(dead_code)]
+  pub fn set_encrypted(&mut self, encrypted: bool) {
         self.header.flags.encrypted = encrypted;
     }
 
     /// Request acknowledgment
-   pub fn request_ack(&mut self) {
+    #[allow(dead_code)]
+  pub fn request_ack(&mut self) {
         self.header.flags.ack_request = true;
     }
 
     /// Decrement TTL — returns false if packet should be dropped
-   pub fn decrement_ttl(&mut self) -> bool {
+    #[allow(dead_code)]
+  pub fn decrement_ttl(&mut self) -> bool {
         if self.header.ttl == 0 {
             return false;
         }
@@ -219,7 +229,8 @@ impl Packet {
         self.header.ttl > 0
     }
 
-    pub fn total_size(&self) -> usize {
+    #[allow(dead_code)]
+  pub fn total_size(&self) -> usize {
         std::mem::size_of::<PacketHeader>() + self.payload.len()
     }
 }
@@ -235,6 +246,7 @@ fn current_time_us() -> u64 {
 /// Application-level messages that sit on top of packets.
 /// A single message may be fragmented across multiple packets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Message {
    pub id:      u64,           // Unique message ID
    pub from:     NodeId,

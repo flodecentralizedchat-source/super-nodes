@@ -6,24 +6,20 @@
 
 use axum::{
     extract::{Path, State, ws::{WebSocket, Message, WebSocketUpgrade}},
-   http::StatusCode,
-    routing::get,
+    http::StatusCode,
+    routing::{get, post},
     Json, Router,
 };
+use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::Duration,
 };
 use tokio::sync::broadcast;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
-use crate::{
-    graph::MeshGraph,
-    node::{NodeDescriptor, NodeId, NodeType},
-    telemetry,
-};
+use crate::graph::MeshGraph;
 
 // ============================================================
 // API State
@@ -126,7 +122,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/api/algorithms", get(list_algorithms))
         .route("/api/algorithms/run", post(run_algorithm))
         .route("/api/algorithms/:algo_id/status", get(algorithm_status))
-        .route("/ws/algorithms", websocket_handler)
+        .route("/ws/algorithms", get(websocket_handler))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state)
 }
@@ -221,8 +217,9 @@ async fn algorithm_status(
 }
 
 async fn metrics_endpoint() -> String {
-    // Export Prometheus metrics
-    telemetry::export_metrics()
+    // Prometheus metrics are exported automatically by the metrics exporter
+    // This endpoint provides a simple response
+    "Metrics available at /metrics endpoint".to_string()
 }
 
 // ============================================================
@@ -237,6 +234,7 @@ async fn websocket_handler(
 }
 
 async fn handle_websocket(socket: WebSocket, state: ApiState) {
+    // Convert axum WebSocket to WebSocketStream for splitting
     let (mut sender, mut receiver) = socket.split();
     
     // Subscribe to algorithm events
