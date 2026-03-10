@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency definitions
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 
 # Create dummy source to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -28,8 +28,8 @@ RUN cargo fetch --locked || true
 # Copy full source code
 COPY . .
 
-# Build in release mode with locked dependencies
-RUN cargo build --release --locked
+# Build in release mode (allow lock file updates)
+RUN cargo build --release
 
 # ============================================================
 # Stage 2: Runtime

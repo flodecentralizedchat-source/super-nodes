@@ -1,7 +1,6 @@
 # Ignore these during docker build
 target/
 **/*.rs.bk
-Cargo.lock
 .git
 .gitignore
 .qoder/
