@@ -4,7 +4,7 @@
 # ============================================================
 # Stage 1: Build
 # ============================================================
-FROM rust:1.82-slim-bookworm as builder
+FROM rust:1.85-slim-bookworm as builder
 
 WORKDIR /app
 
@@ -23,13 +23,13 @@ COPY Cargo.toml ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Cache dependencies (faster rebuilds)
-RUN cargo fetch || true
+RUN cargo fetch --locked || true
 
 # Copy full source code
 COPY . .
 
-# Build in release mode
-RUN cargo build --release
+# Build in release mode with locked dependencies
+RUN cargo build --release --locked
 
 # ============================================================
 # Stage 2: Runtime
