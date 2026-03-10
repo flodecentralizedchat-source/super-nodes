@@ -16,19 +16,10 @@ RUN apt-get update && apt-get install -y \
     clang \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency definitions
-COPY Cargo.toml Cargo.lock ./
-
-# Create dummy source to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Cache dependencies (faster rebuilds)
-RUN cargo fetch --locked || true
-
-# Copy full source code
+# Copy all source and manifests
 COPY . .
 
-# Build in release mode (allow lock file updates)
+# Build in release mode
 RUN cargo build --release
 
 # ============================================================
